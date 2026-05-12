@@ -1,143 +1,217 @@
-# 🔍 SMILES-2026 Hallucination Detection
+# SMILES-2026 Hallucination Detection
 
-Detect whether a small language
-model's answer is *hallucinated* (fabricated) or *truthful* using the model's
-own internal representations (hidden states).
+Detecting whether a small language model's response is **hallucinated**
+(fabricated) or **truthful** by reading the model's own internal
+hidden states with a lightweight binary classifier (a *probe*).
 
-## Overview
+The base LLM is [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)
+— a 24-layer decoder-only transformer with hidden dim 896.
 
-Large (and small) language models sometimes *hallucinate* — they generate
-plausible-sounding text that is factually incorrect.  This competition asks you
-to build a **lightweight binary classifier** (called a *probe*) that reads the
-model's internal hidden states and predicts whether a given response is
-truthful (`label = 0`) or hallucinated (`label = 1`).
+---
 
-The language model used throughout is **[Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)** — a
-decoder-only causal transformer with 24 layers and a hidden dimension of 896.
-It fits comfortably on a free Google Colab T4 GPU.
+## Final results
 
-**Primary ranking metric:** Accuracy on the held-out `test.csv`.
+5-fold stratified cross-validation on `data/dataset.csv`
+(689 samples, 483 hallucinated / 206 truthful):
 
-## Repository Structure
+| Checkpoint | Accuracy | F1 | AUROC |
+|---|---:|---:|---:|
+| Majority-class baseline | 70.10% | 82.42% | — |
+| Probe (train split) | 98.80% | 99.18% | 100.00% |
+| Probe (val split) | 76.63% | 83.98% | 75.06% |
+| **Probe (test split)** | **74.60%** | **82.61%** | **74.36%** |
+
+* **+4.50 pp test accuracy** over the majority baseline.
+* **+4.22 pp AUROC** over a single-MLP starter probe.
+* Per-fold test accuracy stable above the baseline:
+  `73.91 / 76.81 / 74.64 / 74.64 / 72.99` — peak fold 76.81%.
+* `predictions.csv` distribution on the 100 unlabelled test
+  samples: 18 truthful / 82 hallucinated (close to the 30 / 70
+  training prior).
+
+Full per-fold metrics live in `results.json`; the per-iteration
+ablation log is in [`SOLUTION.md`](SOLUTION.md).
+
+---
+
+## Approach in one diagram
 
 ```
-SMILES-HALLUCINATION-DETECTION/
+prompt + response
+        │
+        ▼  Qwen2.5-0.5B forward pass (output_hidden_states=True)
+hidden_states  (25 layers × seq_len × 896)
+        │
+        ▼  aggregation.py
+        │   • last 32 real (response) tokens at layers 6, 12, 18, 24
+        │   • mean-pool + max-pool per layer  →  8 × 896
+        │   • last real-token vector at layer 24  →  1 × 896
+8064-dim feature vector
+        │
+        ▼  probe.py — stacked 5-stream classifier
+        │
+        ├── Stream 1: bagged MLP × 5      (256 GELU + dropout 0.30, AdamW)
+        ├── Stream 2: LightGBM on PCA-100 (leaf-wise growth)
+        ├── Stream 3: CatBoost on PCA-100 (oblivious trees)
+        ├── Stream 4: XGBoost  on PCA-100 (depth-wise growth)
+        └── Stream 5: LightGBM on raw 8064-dim features (feature_fraction=0.10)
+                │
+                ▼  out-of-fold base predictions  →  (n, 5) matrix
+                │
+                ▼  LogisticRegression(C=0.3, balanced)   ← meta-learner
+                │
+                ▼  accuracy-optimal threshold from OOF probs
+            label ∈ {0, 1}
+```
+
+---
+
+## Why this works
+
+1. **Pool only response tokens.** The hallucination signal lives
+   in the model's answer, not in the (long, near-identical) prompt
+   context. Mean+max-pooling the last 32 real tokens at four
+   evenly-spaced late-middle layers isolates that signal.
+
+2. **Five base streams with different inductive biases.** MLPs
+   capture smooth non-linear combinations; the three PCA-100
+   boosters use complementary tree growth strategies (leaf-wise /
+   oblivious / depth-wise); the LightGBM-on-raw stream sees the
+   full 8064-dim space and discovers individual informative
+   feature dimensions that PCA smears out. **This last stream
+   lifted AUROC by ~2 pp** — the single biggest gain at the end.
+
+3. **Stacking, not averaging.** Plain mean-of-means *hurt*
+   accuracy because the PCA-100 boosters were correlated.
+   Training a Logistic Regression meta-learner on out-of-fold
+   base predictions lets each stream's weight be learned from
+   data; strong L2 (`C=0.3`) prevents meta-overfit on only 5
+   features.
+
+4. **Accuracy-optimal threshold via OOF.** With imbalanced classes
+   (70 / 30), the default 0.5 threshold mis-predicts. The threshold
+   used at inference is picked to maximise accuracy on the meta-LR's
+   probabilities over the internal OOF base matrix.
+
+5. **Stratified 5-fold CV.** Stabilises the reported metrics and
+   makes the union of train+val cover every sample, so the final
+   probe trained for `predictions.csv` sees all 689 labelled
+   examples.
+
+---
+
+## Reproducing the results
+
+### Requirements
+
+* Python 3.11.
+* GPU recommended (≈2 GB VRAM is enough for Qwen2.5-0.5B in bf16);
+  CPU works too — feature extraction dominates wall-clock.
+
+### Commands
+
+```bash
+git clone https://github.com/YaroslavPelekhov/SMILES.git
+cd SMILES
+
+python -m venv .venv
+# Linux / macOS
+source .venv/bin/activate
+# Windows
+# .venv\Scripts\activate.bat
+
+pip install -r requirements.txt
+pip install lightgbm catboost xgboost   # extra deps used by the probe
+
+# Linux / macOS / WSL
+python solution.py
+# Windows (PowerShell)
+# $env:PYTHONIOENCODING="utf-8"; python solution.py
+```
+
+The first run downloads `Qwen/Qwen2.5-0.5B` from HuggingFace (~990 MB).
+Subsequent runs can be made fully offline by exporting
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
+
+Running `solution.py` produces:
+
+* `results.json` — averaged metrics from 5-fold cross-validation.
+* `predictions.csv` — predicted labels for the 100 unlabelled
+  `data/test.csv` samples (`id`, `label` columns).
+
+The whole pipeline is deterministic given the random seeds inside
+`splitting.py` and `probe.py`; on the same hardware / library
+versions results are reproducible bit-for-bit.
+
+---
+
+## Repository layout
+
+```
+SMILES/
 ├── data/
-│   ├── dataset.csv        # Labelled training data (prompt, response, label)
-│   └── test.csv           # Unlabelled competition test set
+│   ├── dataset.csv        # 689 labelled (prompt, response, label) samples
+│   └── test.csv           # 100 unlabelled samples (predict these)
 │
-├── solution.py            # Main script - run to create a 
+│   ── Implementation (student-edited) ──────────────────────────
+├── aggregation.py         # Multi-layer mean+max-pool of response tokens
+├── probe.py               # 5-stream stacked classifier + meta-LR
+├── splitting.py           # Stratified 5-fold CV with per-fold val slice
 │
-│   ── Files you implement ──────────────────────────────────────────────
-├── aggregation.py         # Layer selection, token pooling, geometric features
-├── probe.py               # HallucinationProbe — the binary classifier
-├── splitting.py           # Train / validation / test split strategy
+│   ── Fixed infrastructure (unmodified) ────────────────────────
+├── model.py               # Qwen2.5-0.5B loader
+├── solution.py            # Driver: feature extraction → probe → predictions
+├── evaluate.py            # Per-fold metrics, summary table, JSON output
 │
-│   ── Fixed infrastructure (do not edit) ───────────────────────────────
-├── model.py               # Loads Qwen2.5-0.5B and exposes get_model_and_tokenizer()
-├── evaluate.py            # Evaluation loop, metrics, summary table, JSON output
+│   ── Generated artefacts ──────────────────────────────────────
+├── results.json           # 5-fold CV metrics (test acc 74.60%, AUROC 74.36%)
+├── predictions.csv        # 100 predictions for data/test.csv
 │
-├── requirements.txt       # Python dependencies
+│   ── Docs ─────────────────────────────────────────────────────
+├── README.md              # This file
+├── SOLUTION.md            # Full submission report (Q3 requirements)
+├── requirements.txt
 └── LICENSE
 ```
 
+---
 
-## Quick Start
+## Iteration journey
 
-### Google Colab
+Each row is one experimental cycle, measured on the same 5-fold CV
+of `dataset.csv`:
 
-Open the terminal in Colab and run:
+| Iteration | Test Acc | Test AUROC | Notes |
+|---|---:|---:|---|
+| Default skeleton (single MLP, last-token, F1 threshold) | 71.26 % | 70.14 % | Starting point. |
+| + Multi-layer mean-pool of response tokens | 72.13 % | 72.10 % | The pooled vectors carry the bulk of the signal. |
+| + Accuracy-optimal threshold instead of F1 | 72.28 % | 72.10 % | Predictions less biased to the majority class. |
+| + Max-pool features (5-MLP ensemble) | 72.13 % | 72.10 % | Max-pool helps the stacking later. |
+| + LightGBM on PCA-100 (hybrid)         | 73.73 % | 71.05 % | Trees + MLP averaged for the first time. |
+| + Bagging in the MLP ensemble          | 74.60 % | 72.11 % | 85% stratified bootstraps per member. |
+| + CatBoost + XGBoost via stacking      | 74.02 % | 72.28 % | Stacking lets meta-LR weight streams. |
+| **+ LightGBM on raw features**         | **74.60 %** | **74.36 %** | Final config — biggest AUROC jump. |
 
-```python
-git clone https://github.com/ahdr3w/SMILES-HALLUCINATION-DETECTION.git
-cd SMILES-HALLUCINATION-DETECTION
-pip install -r requirements.txt
-python solution.py
-```
+Net gain vs. the starter probe: **+3.34 pp accuracy, +4.22 pp AUROC**.
 
-### Local Setup
+The full ablation log (including ideas that *didn't* help —
+late-only layers, std-pool features, raw-feature CatBoost as a
+6th stream, etc.) is in [`SOLUTION.md`](SOLUTION.md) section 4.
 
-```bash
-git clone https://github.com/ahdr3w/SMILES-HALLUCINATION-DETECTION.git
-cd SMILES-HALLUCINATION-DETECTION
+---
 
-python -m venv .venv
-source .venv/bin/activate        # Linux / macOS
-# .venv\Scripts\activate.bat     # Windows
+## Files you must read
 
-pip install -r requirements.txt
-python solution.py
-```
+* [`SOLUTION.md`](SOLUTION.md) — full submission report
+  (Q3 requirements: reproducibility, final-solution description,
+  experiments and failed attempts).
+* [`results.json`](results.json) — raw 5-fold metrics produced
+  by `evaluate.py`.
+* [`predictions.csv`](predictions.csv) — final predictions for
+  the 100 unlabelled test samples.
 
-## Dataset
+---
 
-`data/dataset.csv` contains 689 labelled samples with three columns:
+## License
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `prompt` | str | Full ChatML-formatted conversation context fed to Qwen |
-| `response` | str | The model's generated response |
-| `label` | float | `1.0` = hallucinated · `0.0` = truthful |
-
-The `prompt` uses the **ChatML** template built into Qwen models:
-
-```
-<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-Given the context, answer the question …<|im_end|>
-<|im_start|>assistant
-```
-
-
-`data/test.csv` is structured identically but the `label` column is null - these are the samples you submit predictions for via a `predictions.csv` generated file.
-
-
-## What You Implement
-
-You are expected to edit **three files**:  
-- `aggregation.py`
-- `probe.py`
-- `splitting.py`
-
-The rest of the codebase shall remain untouched.
-
-**Feature Engineering & Dimensionality Reduction**: Applicants are encouraged to experiment with adding hand-crafted features during the aggregation step, drawing on geometrical or topological methods to enrich the representation of probe outputs. Additionally, you may apply dimensionality reduction techniques within probe.py to compress or refine the feature space. 
-
-## Evaluation
-
-For each fold `evaluate.py` reports four numbers:
-
-| # | Checkpoint | Metrics |
-|---|-----------|---------|
-| 1 | Majority-class baseline | Accuracy, F1 |
-| 2 | `HallucinationProbe` on **training** split | Accuracy, F1, AUROC |
-| 3 | `HallucinationProbe` on **validation** split | Accuracy, F1, AUROC |
-| 4 | `HallucinationProbe` on **test** split | Accuracy, F1, AUROC |
-
-**Accuracy on the `test.csv` is the primary competition metric.**
-
-Results are averaged across folds (if using k-fold) and saved to
-`results.json`.
-
-
-# What is expected from the applicant of SMILES-2026 ?
-
-**Q1:** What must the applicant submit in the application form ?<br>
-**A1:** Submit: 
-1. A link to your Github repository
-2. A link to your `predictions.csv` publicly available file on some cloud storage
-
-**Q2:** What the applicants must include in the repository ?<br>
-**A2:** Your repository must contain: 
-1. `results.json` - produced by the official `solution.py`
-2. Report file in Markdown format `SOLUTION.md`. 
-
-**Q3:** Report requirements (`SOLUTION.md`)<br>
-**A3:** Your report must include:<br>
-- Reproducibility instructions: exact commands to run your solution and acquire the same `predictions.csv`, required environment (if any), any important implementation details needed to reproduce your result.
-- Final solution description: What components you modified ? What your final approach is ? Why you made these choices ? What contributed most to improving the metric ?
-- Experiments and failed attempts: What ideas you tried but did not include in the final solution ? Why they did not work or were discarded ?
-
-**Q4:** Reproducibility<br>
-**A4:** The repository must be self-contained and runnable with the provided `solution.py` file. Your solution must not require changes to the fixed infrastructure files. Running `solution.py` must generate your submitted `predictions.csv`.
+See [`LICENSE`](LICENSE).
